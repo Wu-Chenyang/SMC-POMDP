@@ -51,18 +51,18 @@ class BatteryDataset(torch.utils.data.Dataset):
         self.model_map = {"N190269": torch.tensor(0), "N190907": torch.tensor(1), "N192642": torch.tensor(2)}
         self.record_transform = transforms.Compose([
             transforms.Lambda(lambda x: [torch.tensor(item, dtype=torch.float) for item in x]),
-            transforms.Lambda(lambda x: [normalize(item, [0.485, 0.456, 0.406, 0.343], [0.229, 0.224, 0.225, 0.23]) for item in x]),
+            transforms.Lambda(lambda x: [normalize(item, [3.834, -0.025, 28.39, 37.94], [0.322, 33.80, 15.21, 1.178]) for item in x]),
             transforms.Lambda(lambda x: [F.pad(item, (0, 0, 0, self.max_sequence_length - item.shape[-2])) for item in x]),
             transforms.Lambda(lambda x: torch.stack(x, dim=0)),
             transforms.Lambda(lambda x: torch.swapaxes(x, -1, -2)),
         ])
         self.action_transform = transforms.Compose([
             transforms.Lambda(lambda x: torch.tensor(np.stack(x, axis=0), dtype=torch.float)),
-            transforms.Lambda(lambda x: normalize(x, [0.485, 0.456, 0.406], [0.229, 0.224, 0.225])),
+            transforms.Lambda(lambda x: normalize(x, [31.49, 4.199, -50.03], [6.279, 0.0075, 0.0175])),
         ])
         self.capacity_transform = transforms.Compose([
             transforms.Lambda(lambda x: torch.tensor(np.stack(x, axis=0), dtype=torch.float)[..., None]),
-            transforms.Lambda(lambda x: normalize(x, [0.485], [0.229]))
+            transforms.Lambda(lambda x: normalize(x, [47.025], [3.996]))
         ])
 
     def __getitem__(self, index):
@@ -70,9 +70,7 @@ class BatteryDataset(torch.utils.data.Dataset):
         data = pkl.load(f)
         assert len(data['state_information']) == len(data['action']) == len(data['capacity'])
         result = model_pattern.search(self.cell_list[index])
-        if result == None:
-            print(self.cell_list[index])
-        model = model_pattern.search(self.cell_list[index]).group(1)
+        model = result.group(1)
         if model in self.model_map:
             prior_mixtures = F.one_hot(self.model_map[model], num_classes=3).float()
         else:

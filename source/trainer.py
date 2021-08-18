@@ -11,12 +11,16 @@ import fire
 import random
 
 import numpy as np
+import matplotlib.pyplot as plt
 
-from utils import global_grad_norm
-from proposal_models import NASMCProposal
-from datasets import BatteryDataset
+from utils import global_grad_norm, sample_from_prior, self_contrastive_loss
+from proposal_models import NASMCProposal, TASMCProposal
+# from datasets import BatteryDataset
+from processed_datasets import BatteryDataset
 from smc import smc_pomdp
 from models import BatteryModel
+
+from predicting import smc_prediction
 
 # import multiprocessing
 
@@ -24,19 +28,22 @@ from models import BatteryModel
 class NASMCTrainer:
     def run(self,
             run_dir: str = './runs/',
-            proposal_lr: float = 1e-4,
+            proposal_lr: float = 1e-3,
+            discriminator_lr: float = 1e-2,
             model_lr: float = 1e-4,
             state_dim: int = 5,
-            action_dim: int = 3,
-            obs_dim: int = 5,
-            num_steps: int = 1,
-            save_decimation: int = 100,
+            action_dim: int = 2,
+            obs_dim: int = 13,
+            training_epochs: int = 100000,
+            save_interval: int = 10,
+            test_interval: int = 10,
             num_particles: int = 1000,
-            sequence_length: int = 4096,
-            batch_size: int = 1,
+            sequence_length: int = 50,
+            batch_size: int = 32,
+            filtering_objective: bool = False,
             device_name: str = "cuda" if torch.cuda.is_available() else "cpu",
-            data_dir: str = "data",
-            seed: int = 95):
+            data_dir: str = "processed_data",
+            seed: int = 100):
         np.random.seed(seed)
         random.seed(seed)
         torch.manual_seed(seed)
@@ -46,27 +53,28 @@ class NASMCTrainer:
         os.makedirs(run_dir, exist_ok=True)
         checkpoint_path = os.path.join(run_dir, 'checkpoint.pt')
 
-        cell_list = []
-        cell_list += [os.path.join(data_dir, item) for item in os.listdir(data_dir) if os.path.isfile(os.path.join(data_dir, item))]
+        cell_list = [os.path.join(data_dir, item) for item in os.listdir(data_dir) if os.path.isfile(os.path.join(data_dir, item))]
 
         device = torch.device(device_name)
 
-        proposal = NASMCProposal(state_dim, action_dim, obs_dim)
+        proposal = TASMCProposal(state_dim = state_dim, action_dim = action_dim, obs_dim = obs_dim,
+            mixture_num = 3, hidden_dim = 50, lstm_num = 2, num_hidden_layers = 2)
         model = BatteryModel(
-            state_dim = state_dim, action_dim = action_dim,
-            trans_mixture_num = 2, trans_hidden_dim = 50,
-            obs_mixture_num = 2, obs_hidden_dim = 50,
-            pred_mixture_num = 2, pred_hidden_dim = 10, device=None,
-            # Encoding Net
-            obs_channel = 4, sequence_length = sequence_length, channels = [8] * 5,
-            kernel_sizes = [4] * 6, strides = [4] * 6
+            state_dim = state_dim, action_dim = action_dim, obs_dim = obs_dim,
+            trans_mixture_num = 1, trans_hidden_dim = 20, trans_num_hidden_layers = 1,
+            obs_mixture_num = 1, obs_hidden_dim = 20, obs_num_hidden_layers = 1,
+            device = None
+            # # Encoding Net
+            # obs_channel = 4, sequence_length = 4096, channels = [8] * 6,
+            # kernel_sizes = [4] * 6, strides = [4] * 6
         )
-
-        proposal_optimizer = torch.optim.Adam(proposal.parameters(), lr=proposal_lr)
-        model_optimizer = torch.optim.Adam(model.parameters(), lr=model_lr)
 
         proposal.to(device)
         model.to(device)
+
+        optimizer = torch.optim.Adam([{'params': model.parameters(), 'lr': model_lr},
+                                    {'params': proposal.proposal_parameters(), 'lr': proposal_lr},
+                                    {'params': proposal.discriminator_parameters(), 'lr': discriminator_lr}])
 
         log_dir = None
         step = 1
@@ -74,91 +82,126 @@ class NASMCTrainer:
             checkpoint = torch.load(checkpoint_path, map_location=device)
             proposal.load_state_dict(checkpoint['proposal'])
             model.load_state_dict(checkpoint['model'])
-            proposal_optimizer.load_state_dict(checkpoint['proposal_optimizer'])
+            optimizer.load_state_dict(checkpoint['optimizer'])
             step = checkpoint['step']
             num_particles = checkpoint['num_particles']
-            sequence_length = checkpoint['sequence_length']
             log_dir = checkpoint['log_dir']
 
         summary_writer = SummaryWriter(log_dir)
 
-        proposal.train()
-        model.train()
-
         # multiprocessing.set_start_method('spawn')
-        assert batch_size == 1
-        dl = DataLoader(BatteryDataset(cell_list), batch_size=batch_size, shuffle=True, num_workers=2)
         start_time = time.time()
-        for i, cell in zip(range(num_steps), dl):
-            cell = cell.to(device)
+        for i in range(training_epochs):
+            for batched_data in DataLoader(BatteryDataset(cell_list, sequence_length), batch_size=batch_size, shuffle=True,
+                num_workers=3
+            ):
+                optimizer.zero_grad()
+                proposal.train()
+                model.train()
 
-            smc_result = smc_pomdp(proposal, model, cell, num_particles)
+                batched_data = batched_data.to(device)
 
-            ### Proposal Training
+                smc_result = smc_pomdp(proposal, model, batched_data, num_particles, filtering_objective)
 
-            # proposal_loss = -torch.sum(
-            #     smc_result.intermediate_weights.detach() *
-            #     smc_result.intermediate_proposal_log_probs) / batch_size
-            proposal_loss = -torch.sum(
-                smc_result.final_weights.detach() *
-                smc_result.final_proposal_log_probs.squeeze(-1)) / batch_size
+                ### Proposal Training
 
-            proposal_optimizer.zero_grad()
-            proposal_loss.backward(retain_graph=True)
-            proposal_optimizer.step()
+                proposal_loss = -torch.mean(
+                    torch.sum(
+                    smc_result.weights.detach() *
+                    smc_result.proposal_log_probs, dim=0))
 
-            ### Model Training
+                proposal_loss.backward()
 
-            # model_loss = -torch.sum(
-            #     smc_result.intermediate_weights.detach() *
-            #     smc_result.intermediate_model_log_probs) / batch_size
-            # encoder_loss = -torch.sum(smc_result.imtermediate_weights.detach() *
-            #     smc_result.imtermediate_encoded_obs_log_probs.squeeze(-1)) / batch_size
+                ### Model Training
 
-            model_loss = -torch.sum(
-                smc_result.final_weights.detach() *
-                smc_result.final_model_log_probs.squeeze(-1)) / batch_size
-            encoder_loss = torch.sum(smc_result.final_weights.detach() *
-                smc_result.final_encoded_obs_log_probs.squeeze(-1)) / batch_size
+                # Variational Objectives
+                # model_loss = -torch.mean(smc_result.log_likelihood)
 
-            model_optimizer.zero_grad()
-            model_loss.backward(retain_graph=True)
-            encoder_loss.backward()
-            model_optimizer.step()
+                # Fisher's identity
+                model_loss = -torch.mean(
+                    torch.sum(
+                    smc_result.weights.detach() *
+                    smc_result.model_log_probs, dim=0))
 
-            # Recording
+                # encoder_loss = torch.mean(
+                #     torch.sum(
+                #     smc_result.weights.detach() *
+                #     smc_result.encoded_obs_log_probs, dim=0))
+                
+                model_loss.backward()
 
-            proposal_grad_norm = global_grad_norm(proposal.parameters())
-            model_grad_norm = global_grad_norm(model.parameters())
+                # encoder_loss.backward()
 
-            summary_writer.add_scalar('proposal_loss/train', proposal_loss, step)
-            summary_writer.add_scalar('proposal_gradient', proposal_grad_norm, step)
-            summary_writer.add_scalar('model_loss/train', model_loss, step)
-            summary_writer.add_scalar('model_gradient', model_grad_norm, step)
+                # torch.autograd.set_detect_anomaly(True)
+                # for name, param in model.named_parameters():
+                #     print(name, torch.isfinite(param.grad).all())
 
-            print(f'time = {time.time()-start_time:.1f} step = {step}  proposal_loss = {proposal_loss.item():.1f}  proposal_gradient = {proposal_grad_norm:.1f}  model_loss = {model_loss.item():.1f}  model_gradient = {model_grad_norm:.1f}')
+                # Discriminator Learning
+                actions = torch.zeros(sequence_length, num_particles, 2, device=device)
+                states, observations = sample_from_prior(model, num_particles, sequence_length, future_actions=actions)
+                discriminator_loss = self_contrastive_loss(states[:-1], actions, observations, proposal)
+                discriminator_loss.backward()
 
-            step += 1
-            if step % save_decimation == 0:
-                torch.save(
-                    dict(proposal=proposal.state_dict(),
-                         model=model.state_dict(),
-                         proposal_optimizer=proposal_optimizer.state_dict(),
-                         step=step,
-                         num_particles=num_particles,
-                         sequence_length=sequence_length,
-                         log_dir=summary_writer.log_dir), checkpoint_path)
+                optimizer.step()
 
-        summary_writer.flush()
+                # Recording
 
-        torch.save(
-            dict(proposal=proposal.state_dict(),
-                 model=model.state_dict(),
-                 proposal_optimizer=proposal_optimizer.state_dict(),
-                 step=step,
-                 num_particles=num_particles,
-                 sequence_length=sequence_length,
-                 log_dir=summary_writer.log_dir), checkpoint_path)
+                proposal_grad_norm = global_grad_norm(proposal.proposal_parameters())
+                discriminator_grad_norm = global_grad_norm(proposal.discriminator_parameters())
+                model_grad_norm = global_grad_norm(model.parameters())
+
+                proposal_loss = proposal_loss.item()
+                model_loss = model_loss.item()
+                discriminator_loss = discriminator_loss.item()
+                # encoder_loss = model_loss + encoder_loss.item()
+
+                summary_writer.add_scalar('proposal_loss/train', proposal_loss, step)
+                summary_writer.add_scalar('proposal_gradient', proposal_grad_norm, step)
+                summary_writer.add_scalar('discriminator_loss/train', discriminator_loss, step)
+                summary_writer.add_scalar('discriminator_gradient', discriminator_grad_norm, step)
+                summary_writer.add_scalar('model_loss/train', model_loss, step)
+                # summary_writer.add_scalar('encoder_loss/train', encoder_loss, step)
+                summary_writer.add_scalar('model_gradient', model_grad_norm, step)
+
+                # Outputting
+                print(f'time = {time.time()-start_time:.1f} step = {step} ' +
+                        f'proposal_loss = {proposal_loss:.1f} proposal_gradient = {proposal_grad_norm:.2f} ' +
+                        f'discriminator_loss = {discriminator_loss:.1f} discriminator_gradient = {discriminator_grad_norm:.2f} ' +
+                        f'model_loss = {model_loss:.1f}  model_gradient = {model_grad_norm:.2f}'
+                        )
+
+                # Writing summary
+                step += 1
+                if step % save_interval == 0:
+                    torch.save(
+                        dict(proposal=proposal.state_dict(),
+                            model=model.state_dict(),
+                            optimizer=optimizer.state_dict(),
+                            step=step,
+                            num_particles=num_particles,
+                            log_dir=summary_writer.log_dir), checkpoint_path)
+                if step % test_interval == 0:
+                    proposal.eval()
+                    model.eval()
+                    data = next(iter(DataLoader(BatteryDataset(cell_list, sequence_length), batch_size=1, shuffle=True))).to(device)
+                    assert sequence_length >= 500
+                    future_observations = smc_prediction(proposal, model, data.sub_sequence(500), 1000, 1500, 10)
+                    future_capacity = future_observations[:, :, -1].cpu()
+                    plt.plot(data.observations[0, :, -1].cpu())
+                    for i in range(future_capacity.shape[1]):
+                        plt.plot(range(500, 2000), future_capacity[:, i])
+                    summary_writer.add_figure('filtering/test', plt.gcf(), step)
+                    plt.close()
+
+                summary_writer.flush()
+
+            torch.save(
+                dict(proposal=proposal.state_dict(),
+                    model=model.state_dict(),
+                    optimizer=optimizer.state_dict(),
+                    step=step,
+                    num_particles=num_particles,
+                    log_dir=summary_writer.log_dir), checkpoint_path)
 
 
 if __name__ == '__main__':
