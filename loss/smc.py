@@ -4,6 +4,7 @@ import torch.nn.functional as F
 import torch.distributions as D
 
 from typing import NamedTuple
+from utils.util import batched_index_select, systematic_sampling
 import math
 
 
@@ -13,36 +14,6 @@ class SMCResult(NamedTuple):
     model_log_probs: torch.Tensor
     log_likelihood: torch.Tensor
     # encoded_obs_log_probs: torch.Tensor
-
-def systematic_sampling(weights: torch.Tensor) -> torch.Tensor:
-    """Sample ancestral index using systematic resampling.
-    Get from https://docs.pyro.ai/en/stable/_modules/pyro/infer/smcfilter.html#SMCFilter
-
-    Args:
-        log_weight: log of unnormalized weights, tensor
-            [batch_shape, num_particles]
-    Returns:
-        zero-indexed ancestral index: LongTensor [batch_shape, num_particles]
-    """
-    with torch.no_grad():
-        batch_shape, size = weights.shape[:-1], weights.size(-1)
-        n = weights.cumsum(-1).mul_(size).add_(torch.rand(batch_shape + (1,), device=weights.device))
-        n = n.floor_().long().clamp_(min=0, max=size)
-        diff = torch.zeros(batch_shape + (size + 1,), dtype=torch.long, device=weights.device)
-        diff.scatter_add_(-1, n, torch.tensor(1, device=weights.device, dtype=torch.long).expand_as(weights))
-        ancestors = diff[..., :-1].cumsum(-1).clamp_(min=0, max=size-1)
-    return ancestors
-
-def batched_index_select(inputs, dim: int, index: torch.Tensor, batch_dim: int = 0) -> torch.Tensor:
-    if isinstance(inputs, dict):
-        return {k: batched_index_select(v, dim, index, batch_dim) for k, v in inputs.items()}
-    views = [1 if i != dim else -1 for i in range(len(inputs.shape))]
-    views[batch_dim] = inputs.shape[batch_dim]
-    expanse = list(inputs.shape)
-    expanse[batch_dim] = -1
-    expanse[dim] = -1
-    index = index.view(views).expand(expanse)
-    return torch.gather(inputs, dim, index)
 
 # from memory_profiler import profile
 
@@ -62,37 +33,40 @@ def smc_pomdp(proposal: nn.Module, model: nn.Module, batched_data: NamedTuple, n
     # observations = model.encode(batched_data.observations)
     observations = batched_data.observations
     actions = batched_data.actions
+    categories = batched_data.prior_mixtures
 
     batch_size, seq_len, _ = observations.shape
 
-    proposal_args = proposal.reset(observations, actions, num_particles)
+    kwargs = proposal.reset(observations, actions, num_particles)
 
-    prior_distribution = model.prior(batched_data.prior_mixtures)
-    current_states = prior_distribution.rsample((num_particles,))
+    current_states, incremental_log_weights, proposal_log_probs, kwargs = proposal.prior_proposal(categories, num_particles, **kwargs)
+    prior_distribution = model.prior(categories)
     prior_log_probs = prior_distribution.log_prob(current_states)
 
     model_log_probs = prior_log_probs[..., None, None]
-    proposal_log_probs = model_log_probs.detach() # model prior serves as the prior at the 1-st timestep
-    weights = torch.ones_like(model_log_probs, device=observations.device) / num_particles
-    log_likelihood = torch.zeros((batch_size, 1), device=observations.device)
+    proposal_log_probs = proposal_log_probs[..., None, None]
+    incremental_log_weights = incremental_log_weights[..., None, None]
+
     log_particle_num = math.log(num_particles)
-    # encoded_obs_log_probs = torch.ones_like(model_log_probs, device=observations.device)
+
+    current_logit = model_log_probs - incremental_log_weights
+    weights = F.softmax(current_logit, dim=0)
+    log_likelihood = (torch.logsumexp(current_logit, dim=0) - log_particle_num).squeeze(-1)
 
     for i in range(seq_len):
         current_observations = observations[None, :, i, :].expand(num_particles, -1, -1)
         current_actions = actions[None, :, i, :].expand(num_particles, -1, -1)
 
-        if i == 0:
-            resampled_states = current_states
-        else:
-            # ancestors = residual_sampling(weights[..., -1, 0].permute(1, 0).to("cpu")).to(weights.device)
-            ancestors = systematic_sampling(weights[..., -1, 0].permute(1, 0)).permute(1, 0)
-            # ancestors = D.Categorical(weights[..., -1, 0].permute(1, 0)).sample((num_particles, ))
+        # ancestors = residual_sampling(weights[..., -1, 0].permute(1, 0).to("cpu")).to(weights.device)
+        ancestors = systematic_sampling(weights[..., -1, 0].permute(1, 0)).permute(1, 0)
+        # ancestors = D.Categorical(weights[..., -1, 0].permute(1, 0)).sample((num_particles, ))
 
-            resampled_states = batched_index_select(current_states, 0, ancestors, 1)
-            proposal_args = batched_index_select(proposal_args, 1, ancestors, 2)
+        resampled_states = batched_index_select(current_states, 0, ancestors, 1)
+        kwargs = batched_index_select(kwargs, 1, ancestors, 2)
 
-        current_states, current_proposal_log_probs, proposal_args = proposal.transition_proposal(resampled_states.detach(), current_actions, current_observations, i, **proposal_args)
+        ##### resampled_states.detach()
+        current_states, incremental_log_weights, current_proposal_log_probs, kwargs = proposal.transition_proposal(resampled_states, current_actions, current_observations, i, **kwargs)
+        incremental_log_weights = incremental_log_weights[..., None, None]
         current_proposal_log_probs = current_proposal_log_probs[..., None, None]
 
         transition_distribution = model.transition(resampled_states, current_actions)
@@ -106,7 +80,8 @@ def smc_pomdp(proposal: nn.Module, model: nn.Module, batched_data: NamedTuple, n
         # current_encoded_obs_log_probs = encoded_obs_distribution.log_prob(current_observations)[..., None, None]
 
         current_model_log_probs = (current_transition_log_probs + current_observation_log_probs)[..., None, None]
-        current_logit = current_model_log_probs - current_proposal_log_probs.detach()
+        ##### incremental_log_weights.detach()
+        current_logit = current_model_log_probs - incremental_log_weights
         current_weights = F.softmax(current_logit, dim=0)
         log_likelihood += (torch.logsumexp(current_logit, dim=0) - log_particle_num).squeeze(-1)
 
