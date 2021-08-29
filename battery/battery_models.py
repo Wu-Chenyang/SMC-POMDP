@@ -1,12 +1,12 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import torch.distributions as D
+import pyro.distributions as D
 
 import math
 from model.models import POMDP, VRNN
-from model.building_blocks import CGMM,CGM,MLP
-from utils.util import max_deviation
+from model.building_blocks import CGMM, CGGMM, MLP
+from utils.util import max_deviation, softclamp, eps
 
 class BatteryModel(POMDP):
     def __init__(self, state_dim: int = 5, action_dim: int = 3, obs_dim: int = 5,
@@ -27,9 +27,9 @@ class BatteryModel(POMDP):
         # self.encoder = CNNEncoder(sequence_length, obs_channel, obs_dim, channels, kernel_sizes, strides)
     
     def prior(self, prior_mixtures: torch.Tensor, **kwargs: dict) -> D.Distribution:
-        means = torch.gather(self.prior_mean.clamp(-max_deviation, max_deviation), 0, prior_mixtures.expand((-1, self.prior_mean.shape[-1])))
-        scales = torch.gather(self.prior_scale.clamp(-max_deviation, max_deviation), 0, prior_mixtures.expand((-1, self.prior_scale.shape[-1])))
-        return D.Independent(D.Normal(means, F.softplus(scales, beta=math.log(2.0))), 1)
+        locs = torch.gather(softclamp(self.prior_mean, -max_deviation, max_deviation), 0, prior_mixtures.expand((-1, self.prior_mean.shape[-1])))
+        scales = torch.gather(softclamp(self.prior_scale, eps, max_deviation), 0, prior_mixtures.expand((-1, self.prior_scale.shape[-1])))
+        return D.Independent(D.Normal(locs, softclamp(scales, eps, max_deviation)), 1)
     
     # def encode(self, obs: torch.Tensor) -> torch.Tensor:
     # # Input: Batch * Cycles * Channel * Length
@@ -44,6 +44,9 @@ class VRNNBatteryModel(VRNN):
             obs_mixture_num: int = 2, obs_hidden_dim: int = 50, obs_num_hidden_layers: int = 2,
             proposal_mixture_num: int = 2,  proposal_hidden_dim: int = 50, proposal_num_hidden_layers: int = 2,
             rnn_hidden_dim: int = 50, rnn_num: int = 1,
+            state_encoding_dim: int = 10, hist_encoding_dim: int = 10,
+            gated_transition: bool = True, independent_trans: bool = True,
+            independent_obs: bool = True, identity_obs_covariance: bool = False,
             category_num: int = 4,
             device = None
             # # Encoding Net
@@ -55,19 +58,22 @@ class VRNNBatteryModel(VRNN):
                         obs_mixture_num, obs_hidden_dim, obs_num_hidden_layers,
                         proposal_mixture_num,  proposal_hidden_dim, proposal_num_hidden_layers,
                         rnn_hidden_dim, rnn_num,
+                        state_encoding_dim, hist_encoding_dim,
+                        gated_transition, independent_trans,
+                        independent_obs, identity_obs_covariance,
                         device)
 
         self.prior_mean = nn.Parameter(torch.zeros(4, state_dim, device=device))
         self.prior_scale = nn.Parameter(torch.full((4, state_dim), 0.1, device=device))
         self.category_num = category_num
-        self.category_encoder = MLP([category_num, rnn_hidden_dim])
+        self.category_encoder = nn.Linear(category_num, hist_encoding_dim)
 
         # self.encoder = CNNEncoder(sequence_length, obs_channel, obs_dim, channels, kernel_sizes, strides)
     def prior(self, prior_mixtures, batch_shape, **kwargs):
-        means = torch.gather(self.prior_mean.clamp(-max_deviation, max_deviation), 0, prior_mixtures.expand((-1, self.prior_mean.shape[-1]))).expand(batch_shape + self.prior_mean.shape[-1:])
-        scales = F.softplus(torch.gather(self.prior_scale.clamp(-max_deviation, max_deviation), 0, prior_mixtures.expand((-1, self.prior_scale.shape[-1]))), beta=math.log(2.0)).expand(batch_shape + self.prior_scale.shape[-1:])
-        # return D.MultivariateNormal(means, scale_tril=torch.diag_embed(scales)), kwargs
-        return D.Independent(D.Normal(means, scales), 1), kwargs
+        locs = torch.gather(softclamp(self.prior_mean, -max_deviation, max_deviation), 0, prior_mixtures.expand((-1, self.prior_mean.shape[-1]))).expand(batch_shape + self.prior_mean.shape[-1:])
+        scales = torch.gather(softclamp(self.prior_scale, eps, max_deviation), 0, prior_mixtures.expand((-1, self.prior_scale.shape[-1]))).expand(batch_shape + self.prior_scale.shape[-1:])
+        # return D.MultivariateNormal(locs, scale_tril=torch.diag_embed(scales)), kwargs
+        return D.Independent(D.Normal(locs, scales), 1), kwargs
 
     def prior_proposal(self, category: torch.Tensor, batch_shape, **kwargs: dict):
         reshaped_h = kwargs.get('reshaped_h', None)
@@ -92,7 +98,7 @@ class VRNNBatteryModel(VRNN):
         batch_shape = (batch_size,)
         long_shape = (model.h0.shape[0],) + len(batch_shape) * (1,) + (model.h0.shape[-1],)
         h = model.h0.reshape(long_shape).expand(-1, *batch_shape, -1).contiguous()
-        reshaped_h = h.reshape((model.rnn_num, -1, model.rnn_hidden_dim)).swapaxes(0, 1).reshape(batch_shape + (-1,))
+        reshaped_h = h.reshape((model.rnn_num, -1, model.rnn_hidden_dim)).transpose(0, 1).reshape(batch_shape + (-1,))
         kwargs = {'hidden_states': h, 'reshaped_h': reshaped_h}
         category = torch.randint(4, (batch_size, 1), device=device)
         prior_distribution, kwargs= model.prior(category, batch_shape, **kwargs)
@@ -127,7 +133,8 @@ class VRNNBatteryModel(VRNN):
             transition_distribution, kwargs = model.transition(current_states, current_actions, **kwargs)
             current_states = transition_distribution.sample()
             observation_distribution, kwargs = model.observation(current_actions, current_states, **kwargs)
-            current_observations = observation_distribution.sample()
+            # current_observations = observation_distribution.sample()
+            current_observations = observation_distribution.mean
             obs_encoding = model.ao_encoder(torch.cat((current_actions, current_observations), dim=-1))
             kwargs['obs_encoding'] = obs_encoding
 

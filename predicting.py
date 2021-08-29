@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import torch.distributions as D
+import pyro.distributions as D
 
 from typing import NamedTuple
 from utils.util import sample_from_prior, batched_index_select, systematic_sampling

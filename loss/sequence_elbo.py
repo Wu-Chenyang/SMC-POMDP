@@ -1,8 +1,8 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import torch.distributions as D
-from torch.distributions.kl import kl_divergence
+import pyro.distributions as D
+from pyro.distributions.kl import kl_divergence
 
 from typing import NamedTuple
 import math

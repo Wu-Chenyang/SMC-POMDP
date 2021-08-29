@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import torch.distributions as D
+import pyro.distributions as D
 
 from typing import NamedTuple
 from utils.util import batched_index_select, systematic_sampling
@@ -18,17 +18,9 @@ class SMCResult(NamedTuple):
 # from memory_profiler import profile
 
 # @profile
-def smc_pomdp(proposal: nn.Module, model: nn.Module, batched_data: NamedTuple, num_particles: int, filtering_objective: bool = False) -> SMCResult:
-    # Dimensionality Analysis
-    #
-    # Observations: [batch_size, sequence_length, obs_dim]
-    # Weights: [num_particles, batch_size, num_timesteps, 1]
-    # Final Weights: [num_particles, batch_size, 1]
-    # LSTM State: [num_particles, batch_size, hidden_dim]
-    # Current States: [num_particles, batch_size, state_dim]
-    # Current Observations: [1, batch_size, obs_dim]
-    # Proposal Log Probabilities: [num_particles, batch_size, num_timesteps, 1]
-    # Log Likelihood: [batch_size, 1]
+identity_twister = lambda x: 1.0
+def auxiliary_smc(proposal: nn.Module, model: nn.Module, batched_data: NamedTuple,
+            num_particles: int, twister = identity_twister, filtering_objective: bool = False) -> SMCResult:
 
     # observations = model.encode(batched_data.observations)
     observations = batched_data.observations

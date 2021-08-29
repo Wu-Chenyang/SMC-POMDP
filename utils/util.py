@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
-from torch.distributions import (
+import torch.nn.functional as F
+from pyro.distributions import (
     Independent,
     MultivariateNormal,
     Normal,
@@ -10,6 +11,36 @@ import math
 
 eps = 1e-5
 max_deviation = 10.0
+
+def softclamp(input: torch.Tensor, min: float, max: float, boundary = None) -> torch.Tensor:
+    assert max > min
+    if boundary is not None:
+        assert 0.0 < boundary <= (max - min) / 2.0
+    else:
+        boundary = 1e-5
+    logsigmoid_offset = max + math.log(1.0 - math.exp(-boundary))
+    softplus_offset = min - math.log(1.0 - math.exp(-boundary))
+    output = torch.zeros_like(input, device=input.device)
+    large_index = input > max - boundary
+    small_index = input < min + boundary
+    med_index = torch.logical_not(torch.logical_or(large_index, small_index))
+    output[large_index] = max + F.logsigmoid(input[large_index] - logsigmoid_offset)
+    output[small_index] = min + F.softplus(input[small_index] - softplus_offset)
+    output[med_index] = input[med_index]
+    return output
+
+class Softclamp(nn.Module):
+    def __init__(self, min: float, max: float, boundary: float = 1e-5) -> None:
+        super(Softclamp, self).__init__()
+        self.min = min
+        self.max = max
+        self.boundary = boundary
+
+    def forward(self, input: torch.Tensor) -> torch.Tensor:
+        return softclamp(input, self.min, self.max, self.boundary)
+
+    def extra_repr(self) -> str:
+        return 'min={}, max={}, boundary={}'.format(self.min, self.max, self.boundary)
 
 def global_grad_norm(params):
     grad_norm = 0.0
@@ -90,17 +121,19 @@ def sample_from_prior(model: nn.Module, batch_size: int, seq_len: int, start_sta
 
     return states, observations
 
-@register_kl(Independent, MultivariateNormal)
-def _kl_independent_mvn(p, q):
-    if isinstance(p.base_dist, Normal) and p.reinterpreted_batch_ndims == 1:
-        dim = q.event_shape[0]
-        p_cov = p.base_dist.scale ** 2
-        q_precision = q.precision_matrix.diagonal(dim1=-2, dim2=-1)
-        return (
-            0.5 * (p_cov * q_precision).sum(-1)
-            - 0.5 * dim * (1 + math.log(2 * math.pi))
-            - q.log_prob(p.base_dist.loc)
-            - p.base_dist.scale.log().sum(-1)
-        )
+def reverse_sequences(mini_batch, seq_lengths):
+    reversed_mini_batch = torch.zeros_like(mini_batch)
+    for b in range(mini_batch.size(0)):
+        T = seq_lengths[b]
+        time_slice = torch.arange(T - 1, -1, -1, device=mini_batch.device)
+        reversed_sequence = torch.index_select(mini_batch[b, :, :], 0, time_slice)
+        reversed_mini_batch[b, 0:T, :] = reversed_sequence
+    return reversed_mini_batch
 
-    raise NotImplementedError
+
+# this function takes the hidden state as output by the PyTorch rnn and
+# unpacks it it; it also reverses each sequence temporally
+def pad_and_reverse(rnn_output, seq_lengths):
+    rnn_output, _ = nn.utils.rnn.pad_packed_sequence(rnn_output, batch_first=True)
+    reversed_output = reverse_sequences(rnn_output, seq_lengths)
+    return reversed_output

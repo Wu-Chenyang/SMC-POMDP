@@ -1,8 +1,11 @@
-# Sequence Models with Hidden States
+# Sequential Hidden Variable Model
 
 TODO:
 
 * Allow models not to condition on actions.
+* Allow models to condition on invariant information throughtout a sequence.
+* Allow models to have independent transition or observation.
+* Allow algorithms to handle non-reparameterized models and the reparameterized ones.
 * Make all models and proposals to share the same state dict
 * Make all models and proposals  be able to condition on some prior knowledges.
 * Modify algorithms to accomodate the above changes

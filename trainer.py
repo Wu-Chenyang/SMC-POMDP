@@ -16,58 +16,65 @@ import numpy as np
 import matplotlib.pyplot as plt
 
 from utils.util import global_grad_norm, sample_from_prior
-from proposal_models import NASMCProposal, TASMCProposal
-# from datasets import BatteryDataset
-from processed_datasets import BatteryDataset
-from loss.smc import smc_pomdp
+from model.guides import SmoothingProposal
+from model.models import DMM
+from loss.auxiliary_smc import auxiliary_smc
 from loss.self_contrastive import self_contrastive_loss
-from models import BatteryModel
 from itertools import chain
-import pickle as pkl
 
 from predicting import smc_prediction
+
+from battery.datasets import BatteryDataset, get_cell_list
+
+import pyro
+from pyro.infer import (
+    SVI,
+    JitTrace_ELBO,
+    Trace_ELBO,
+    TraceMeanField_ELBO,
+    TraceEnum_ELBO,
+    TraceTMC_ELBO,
+    config_enumerate,
+)
 
 # import multiprocessing
 import re
 checkpoint_ptn = re.compile('(\d+)\.pt\Z')
-
-def get_cell_list(data_dir, seq_len):
-    cell_list = []
-    for item in os.listdir(data_dir):
-        if os.path.isfile(os.path.join(data_dir, item)):
-            cell = os.path.join(data_dir, item)
-            with open(cell, 'rb') as f:
-                data = pkl.load(f)
-                if len(data['state_information']) >= seq_len:
-                    cell_list.append(cell)
-    return cell_list
-
 
 class Trainer:
     def run(self,
             run_dir: str = './runs/',
             checkpoint_dir: str = './runs/',
             checkpoint_path = None,
-            proposal_lr: float = 1e-3,
-            discriminator_lr: float = 1e-2,
-            model_lr: float = 1e-4,
             update_lr: bool = False,
-            state_dim: int = 10,
-            action_dim: int = 2,
-            obs_dim: int = 13,
+
             training_epochs: int = 40,
             save_interval: int = 10,
             test_interval: int = 10,
             num_particles: int = 1000,
             sequence_length = 50,
             batch_size: int = 32,
-            filtering_objective: bool = False,
             device_name: str = "cuda" if torch.cuda.is_available() else "cpu",
-            data_dir: str = "processed_data",
+
+            dataset: str = "battery",
+            config: dict = {'state_dim': 3, 'static_state_dim': 2},
+            model: str = "DMM",
+            model_lr: float = 1e-3,
+            model_config: dict = {},
+            guide: str = "SmoothingProposal",
+            guide_lr: float = 1e-3,
+            guide_config: dict = {'proposal_mixture_num': 1, 'rnn_num': 1},
+            loss: str = "Trace_ELBO",
+            loss_config: dict = {'num_particles': 1, 'vectorize_particles': True},
+            optimizer: str = "ClippedAdam",
+            optimizer_config: dict = {'betas': (0.95, 0.999), 'clip_norm': 10.0, 'lrd': 0.99999, 'weight_decay': 1.0},
+            inference_algorithm: str = "SVI",
+            infer_config: dict = {},
             seed = None,
             verbose: bool = False,
             debug: bool = False):
 
+        # Set seeds
         if seed is not None:
             np.random.seed(seed)
             random.seed(seed)
@@ -75,11 +82,26 @@ class Trainer:
             torch.cuda.manual_seed(seed)
             torch.cuda.manual_seed_all(seed)
 
+        # Debug
         torch.autograd.set_detect_anomaly(debug)
+        
+        # Load Dataset
+        if dataset is "battery":
+            data_dir = 'battery/data'
+            cell_list = get_cell_list(data_dir, 1)
+            data_loader = DataLoader(BatteryDataset(cell_list, sequence_length), batch_size=batch_size, shuffle=True, num_workers=2)
+            steps_per_epoch = len(data_loader)
+            action_dim = 1
+            obs_dim = 11
+            static_info_dim = 4
+            with_initial_obs=False
+        else:
+            raise ValueError(f'{dataset} is not a valid dataset')
 
+        # Load the checkpoint specified by checkpoint_path or the latest checkpoint in checkpoint_dir
         os.makedirs(run_dir, exist_ok=True)
         os.makedirs(checkpoint_dir, exist_ok=True)
-        if checkpoint_path == None:
+        if checkpoint_path is None:
             checkpoint_path = [item for item in os.listdir(checkpoint_dir) if os.path.isfile(os.path.join(checkpoint_dir, item)) and checkpoint_ptn.search(item) != None]
             if len(checkpoint_path) > 0:
                 checkpoint_path = os.path.join(checkpoint_dir, str(max(int(checkpoint_ptn.search(item).group(1)) for item in checkpoint_path)) + '.pt')
@@ -88,53 +110,65 @@ class Trainer:
         elif not os.path.isfile(checkpoint_path):
             raise ValueError('checkpoint_path should point to a checkpoint file or set to None')
 
+        # Set training device
         device = torch.device(device_name)
 
-        proposal = TASMCProposal(state_dim = state_dim, action_dim = action_dim, obs_dim = obs_dim,
-            mixture_num = 3, hidden_dim = 50, rnn_num = 2, num_hidden_layers = 2)
-        model = BatteryModel(
-            state_dim = state_dim, action_dim = action_dim, obs_dim = obs_dim,
-            trans_mixture_num = 1, trans_hidden_dim = 20, trans_num_hidden_layers = 1,
-            obs_mixture_num = 1, obs_hidden_dim = 20, obs_num_hidden_layers = 1,
-            device = None
-            # # Encoding Net
-            # obs_channel = 4, sequence_length = 4096, channels = [8] * 6,
-            # kernel_sizes = [4] * 6, strides = [4] * 6
-        )
+        # Make sure hidden state dimensions are specified
+        assert config.get('state_dim', None) is not None
+        assert config.get('static_state_dim', None) is not None
 
-        proposal.to(device)
+        # Initialize Model
+        if model == "DMM":
+            model = DMM(action_dim=action_dim, obs_dim=obs_dim,
+                with_initial_obs=with_initial_obs, static_info_dim=static_info_dim,
+                **config, **model_config
+            )
+        else:
+            raise NotImplementedError(f'{model} is not implemented.')
         model.to(device)
 
-        steps_per_epoch = 0
-        data_loaders = []
-        if isinstance(sequence_length, int):
-            cell_list = get_cell_list(data_dir, sequence_length)
-            data_loader = DataLoader(BatteryDataset(cell_list, sequence_length), batch_size=batch_size, shuffle=True, num_workers=2)
-            steps_per_epoch += len(data_loader)
-            data_loaders.append(data_loader)
+        # Initialize Guide
+        if guide == "SmoothingProposal":
+            guide = SmoothingProposal(action_dim=action_dim, obs_dim=obs_dim,
+                with_initial_obs=with_initial_obs, static_info_dim=static_info_dim,
+                **config, **guide_config
+            )
         else:
-            for seq_len in sequence_length:
-                cell_list = get_cell_list(data_dir, seq_len)
-                data_loader = DataLoader(BatteryDataset(cell_list, seq_len), batch_size=batch_size, shuffle=True, num_workers=2)
-                steps_per_epoch += len(data_loader)
-                data_loaders.append(data_loader)
+            raise NotImplementedError(f'{guide} is not implemented.')
+        guide.to(device)
 
-        optimizer = torch.optim.Adam([{'params': model.parameters(), 'lr': model_lr},
-                                    {'params': proposal.proposal_parameters(), 'lr': proposal_lr},
-                                    {'params': proposal.discriminator_parameters(), 'lr': discriminator_lr}])
-        scheduler = torch.optim.lr_scheduler.OneCycleLR(optimizer, max_lr=[model_lr, proposal_lr, discriminator_lr],
-                                                        steps_per_epoch=steps_per_epoch,
-                                                        epochs=training_epochs, verbose=verbose)
+        if optimizer == 'ClippedAdam':
+            optimizer = pyro.optim.ClippedAdam([{'params': model.parameters(), 'lr': model_lr},
+                                        {'params': guide.parameters(), 'lr': guide_lr}], **optimizer_config)
+        else:
+            raise NotImplementedError(f'{optimizer} is not supported yet')
 
+        # optimizer = torch.optim.Adam([{'params': model.parameters(), 'lr': model_lr},
+        #                             {'params': guide.parameters(), 'lr': guide_lr},])
+        # scheduler = torch.optim.lr_scheduler.OneCycleLR(optimizer, max_lr=[model_lr, guide_lr],
+        #                                                 steps_per_epoch=steps_per_epoch,
+        #                                                 epochs=training_epochs, verbose=verbose)
+
+        if loss == 'Trace_ELBO':
+            loss = Trace_ELBO(**loss_config)
+        elif loss == 'TraceMeanField_ELBO':
+            loss = TraceMeanField_ELBO(**loss_config)
+        else:
+            raise NotImplementedError(f'{loss} is not implemented.')
+
+        if inference_algorithm == 'SVI':
+            inference_algorithm = SVI(model.model, guide.guide, optimizer, loss)
+        else:
+            raise NotImplementedError(f'{inference_algorithm} is not implemented.')
+
+        # Save model
         log_dir = None
         step = 1
         if checkpoint_path is not None and os.path.exists(checkpoint_path):
             checkpoint = torch.load(checkpoint_path, map_location=device)
-            proposal.load_state_dict(checkpoint['proposal'])
+            guide.load_state_dict(checkpoint['guide'])
             model.load_state_dict(checkpoint['model'])
             optimizer.load_state_dict(checkpoint['optimizer'])
-            if not update_lr:
-                scheduler.load_state_dict(checkpoint['scheduler'])
             step = checkpoint['step']
             num_particles = checkpoint['num_particles']
             log_dir = checkpoint['log_dir']
@@ -147,21 +181,21 @@ class Trainer:
         for epoch_idx in range(training_epochs):
             for batch_idx, batched_data in enumerate(chain(*data_loaders)):
                 optimizer.zero_grad()
-                proposal.train()
+                guide.train()
                 model.train()
 
                 batched_data = batched_data.to(device)
 
-                smc_result = smc_pomdp(proposal, model, batched_data, num_particles, filtering_objective)
+                smc_result = smc_pomdp(guide, model, batched_data, num_particles, filtering_objective)
 
                 ### Proposal Training
 
-                proposal_loss = -torch.mean(
+                guide_loss = -torch.mean(
                     torch.sum(
                     smc_result.weights.detach() *
-                    smc_result.proposal_log_probs, dim=0))
+                    smc_result.guide_log_probs, dim=0))
 
-                proposal_loss.backward()
+                guide_loss.backward()
 
                 ### Model Training
 
@@ -186,26 +220,26 @@ class Trainer:
                 # Discriminator Learning
                 actions = torch.zeros(2000, num_particles, 2, device=device)
                 states, observations = sample_from_prior(model, num_particles, 2000, future_actions=actions)
-                discriminator_loss = self_contrastive_loss(states[:-1], actions, observations, proposal)
+                discriminator_loss = self_contrastive_loss(states[:-1], actions, observations, guide)
                 discriminator_loss.backward()
 
-                # clip_grad_norm_(chain(model.parameters(), proposal.parameters()), 10, 2, True)
+                # clip_grad_norm_(chain(model.parameters(), guide.parameters()), 10, 2, True)
                 optimizer.step()
                 scheduler.step()
 
                 # Recording
 
-                proposal_grad_norm = global_grad_norm(proposal.proposal_parameters())
-                discriminator_grad_norm = global_grad_norm(proposal.discriminator_parameters())
+                guide_grad_norm = global_grad_norm(guide.guide_parameters())
+                discriminator_grad_norm = global_grad_norm(guide.discriminator_parameters())
                 model_grad_norm = global_grad_norm(model.parameters())
 
-                proposal_loss = proposal_loss.item()
+                guide_loss = guide_loss.item()
                 model_loss = model_loss.item()
                 discriminator_loss = discriminator_loss.item()
                 # encoder_loss = model_loss + encoder_loss.item()
 
-                summary_writer.add_scalar('proposal_loss/train', proposal_loss, step)
-                summary_writer.add_scalar('proposal_gradient', proposal_grad_norm, step)
+                summary_writer.add_scalar('guide_loss/train', guide_loss, step)
+                summary_writer.add_scalar('guide_gradient', guide_grad_norm, step)
                 summary_writer.add_scalar('discriminator_loss/train', discriminator_loss, step)
                 summary_writer.add_scalar('discriminator_gradient', discriminator_grad_norm, step)
                 summary_writer.add_scalar('model_loss/train', model_loss, step)
@@ -214,7 +248,7 @@ class Trainer:
 
                 # Outputting
                 print(f'time = {time.time()-start_time:.1f} step = {step} ' +
-                        f'proposal_loss = {proposal_loss:.1f} proposal_gradient = {proposal_grad_norm:.2f} ' +
+                        f'guide_loss = {guide_loss:.1f} guide_gradient = {guide_grad_norm:.2f} ' +
                         f'discriminator_loss = {discriminator_loss:.1f} discriminator_gradient = {discriminator_grad_norm:.2f} ' +
                         f'model_loss = {model_loss:.1f}  model_gradient = {model_grad_norm:.2f}'
                         )
@@ -223,7 +257,7 @@ class Trainer:
                 step += 1
                 if step % save_interval == 0:
                     torch.save(
-                        dict(proposal=proposal.state_dict(),
+                        dict(guide=guide.state_dict(),
                             model=model.state_dict(),
                             optimizer=optimizer.state_dict(),
                             scheduler=scheduler.state_dict(),
@@ -231,10 +265,10 @@ class Trainer:
                             num_particles=num_particles,
                             log_dir=summary_writer.log_dir), os.path.join(checkpoint_dir, str(step) + '.pt'))
                 if step % test_interval == 0:
-                    proposal.eval()
+                    guide.eval()
                     model.eval()
                     data = next(iter(DataLoader(BatteryDataset(get_cell_list(data_dir, 2000), 2000), batch_size=1, shuffle=True))).to(device)
-                    future_observations = smc_prediction(proposal, model, data.sub_sequence(500), 1000, 1500, 2)
+                    future_observations = smc_prediction(guide, model, data.sub_sequence(500), 1000, 1500, 2)
                     future_capacity = future_observations[:, :, -1].cpu()
                     for epoch_idx in range(future_capacity.shape[1]):
                         plt.plot(range(500, 2000), future_capacity[:, epoch_idx])
@@ -245,7 +279,7 @@ class Trainer:
                 summary_writer.flush()
 
         torch.save(
-            dict(proposal=proposal.state_dict(),
+            dict(guide=guide.state_dict(),
                 model=model.state_dict(),
                 optimizer=optimizer.state_dict(),
                 scheduler=scheduler.state_dict(),
